@@ -16,6 +16,8 @@ pub use btls::ssl::{ExtensionType, KeyShare};
 use bytes::{BufMut, Bytes, BytesMut};
 use compress::CertificateCompressor;
 
+pub(crate) use self::conn::HandshakeFailure;
+
 /// Http extension carrying extra TLS layer information.
 /// Made available to clients on responses when `tls_info` is set.
 #[derive(Debug, Clone)]

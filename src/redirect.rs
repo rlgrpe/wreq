@@ -50,6 +50,48 @@ pub struct Attempt<'a, const PENDING: bool = true> {
     pub previous: Cow<'a, [Uri]>,
 }
 
+type BeforeRedirectCallback =
+    dyn Fn(&http::Request<()>) -> crate::rt::BoxSendFuture + Send + Sync;
+
+/// An asynchronous callback before an allowed redirect is sent.
+///
+/// Insert this into a request's extensions to observe each followed destination
+/// after native method/body-header conversion and sensitive-header removal.
+/// The callback sees client default headers, but not transport-generated headers
+/// or cookies selected by the cookie store. It cannot change the request or the
+/// redirect decision, and is not called for the initial request or a stopped
+/// redirect, including [`Policy::none()`] and the redirect limit.
+///
+/// The returned future is awaited before the destination service is polled.
+/// Dropping the request future drops the callback future. Callback wait is
+/// excluded from the request's transport timeout, preserving the consumed
+/// network and response-body budget rather than resetting it at each hop.
+/// The callback must bound its own work; caller cancellation still cancels it.
+#[derive(Clone)]
+pub struct BeforeRedirect(Arc<BeforeRedirectCallback>);
+
+impl BeforeRedirect {
+    /// Creates a callback. Copy any metadata needed by the owned future from
+    /// the borrowed request head; the request body is never exposed or copied.
+    pub fn new<F, Fut>(callback: F) -> Self
+    where
+        F: Fn(&http::Request<()>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        Self(Arc::new(move |request| Box::pin(callback(request))))
+    }
+
+    pub(crate) fn call(&self, request: &http::Request<()>) -> crate::rt::BoxSendFuture {
+        (self.0)(request)
+    }
+}
+
+impl fmt::Debug for BeforeRedirect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BeforeRedirect").finish_non_exhaustive()
+    }
+}
+
 /// An action to perform when a redirect status code is found.
 #[derive(Debug)]
 pub struct Action(redirect::Action);

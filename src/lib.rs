@@ -335,7 +335,7 @@ pub use self::{
         response::Response,
         upgrade::Upgraded,
     },
-    error::{Error, Result},
+    error::{Error, Result, TransportCause},
     ext::{ResponseBuilderExt, ResponseExt},
     group::Group,
     into_uri::IntoUri,

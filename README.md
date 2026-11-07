@@ -30,27 +30,23 @@ An ergonomic and modular Rust HTTP Client for high-fidelity protocol matching, f
 
 ## Example
 
-The following example uses the [Tokio](https://tokio.rs) runtime with optional features enabled by adding this to your `Cargo.toml`:
+This example uses Tokio and the tagged fork without a consumer `[patch]` table:
 
 ```toml
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-wreq = "0.16"
-wreq-util = "0.2"
+wreq = { version = "0.16.1", git = "https://github.com/rlgrpe/wreq", tag = "v0.16.1+rlgrpe.1" }
 ```
 
 And then the code:
 
 ```rust
 use wreq::Client;
-use wreq_util::Emulation;
 
 #[tokio::main]
 async fn main() -> wreq::Result<()> {
     // Build a client
-    let client = Client::builder()
-        .emulation(Emulation::Safari26)
-        .build()?;
+    let client = Client::builder().build()?;
 
     // Use the API you're already familiar with
     let resp = client.get("https://pingly.us.kg/api/all").send().await?;
@@ -58,6 +54,29 @@ async fn main() -> wreq::Result<()> {
     Ok(())
 }
 ```
+
+## Fork provenance and dependencies
+
+This patch retains package version `0.16.1` and builds on upstream commit
+`d2268c4d54ee40a518066c92f30bab9516764663`. It adds typed transport causes,
+cross-origin authorization handling, and request-owned connection setup.
+
+The manifest directly pins `http2` to `rlgrpe/http2` tag `v0.5.20+rlgrpe.1`
+and both `wreq-proto` and `wreq-rt` to `rlgrpe/wreq-proto` tag
+`v0.2.6+rlgrpe.1`. The three TLS packages use the same upstream btls revision,
+`0f5416d1f61eb4f64a9f2f4d8b867495305d61c1`. Their sibling dependencies share
+those sources without relying on root patches.
+
+An emulation utility used with this fork must depend on the same wreq Git source
+and tag. A registry wreq dependency is a distinct source even when its package
+version is identical; do not mix their public types.
+
+The lower-level releases document accepted Rust 1.98 Clippy baselines:
+[30 http2 diagnostics](https://github.com/rlgrpe/http2/blob/v0.5.20%2Brlgrpe.1/CHANGELOG.md)
+and [five protocol diagnostics](https://github.com/rlgrpe/wreq-proto/blob/v0.2.6%2Brlgrpe.1/wreq-proto/CHANGELOG.md).
+Their strict lint checks did not pass. All reported statements were compared
+against the corresponding upstream or published source, and CI and lint rules
+remain unchanged. This exception does not cover new diagnostics.
 
 ## Behavior
 
@@ -72,6 +91,10 @@ Due to the complexity of **TLS** encryption and the widespread adoption of **HTT
 - **Device Emulation**
 
 **TLS** and **HTTP/2** fingerprints are often identical across various browser models because these underlying protocols evolve slower than browser release cycles. **100+ browser device emulation profiles** are maintained in [wreq-util](https://github.com/0x676e67/wreq-util).
+
+- **Connection setup cancellation**
+
+Connection setup belongs to the request waiting for it. If a pooled connection becomes available first, the unused connection attempt is canceled rather than completed in the background. Canceling a request during setup also cancels that attempt. Other requests waiting for the same HTTP/2 connection can resume connection acquisition without replaying a sent request. This applies to both Tokio and Compio and does not require a configured connection timeout.
 
 ## Building
 

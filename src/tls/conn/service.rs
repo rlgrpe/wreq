@@ -1,5 +1,6 @@
 use std::{
-    fmt::Debug,
+    error::Error as StdError,
+    fmt::{self, Debug},
     future::Future,
     pin::Pin,
     task::{Context, Poll},
@@ -18,12 +19,54 @@ use crate::{
 
 type BoxFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send>>;
 
+/// A failed TLS handshake, with whether the peer certificate failed verification.
+///
+/// Used by `crate::Error::transport_cause` to distinguish certificate verification
+/// failures from other handshake failures.
+#[derive(Debug)]
+pub(crate) struct HandshakeFailure {
+    certificate: bool,
+    source: btls::ssl::Error,
+}
+
+impl HandshakeFailure {
+    #[inline]
+    pub(crate) fn is_certificate(&self) -> bool {
+        self.certificate
+    }
+}
+
+impl fmt::Display for HandshakeFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TLS handshake failed")
+    }
+}
+
+impl StdError for HandshakeFailure {
+    #[inline]
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.source)
+    }
+}
+
 async fn perform_handshake<T>(ssl: btls::ssl::Ssl, conn: T) -> Result<MaybeHttpsStream<T>, BoxError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let mut stream = SslStream::new(ssl, conn)?;
-    Pin::new(&mut stream).connect().await?;
+    if let Err(source) = Pin::new(&mut stream).connect().await {
+        // BoringSSL reports INVALID_CALL until a peer certificate was verified;
+        // only a real verification error marks a certificate failure.
+        let certificate = matches!(
+            stream.ssl().verify_result(),
+            Err(error) if error != btls::x509::X509VerifyError::INVALID_CALL
+        );
+        return Err(HandshakeFailure {
+            certificate,
+            source,
+        }
+        .into());
+    }
     Ok(MaybeHttpsStream::Https(stream))
 }
 

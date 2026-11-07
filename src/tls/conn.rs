@@ -5,6 +5,8 @@ mod macros;
 mod ext;
 mod service;
 
+pub(crate) use self::service::HandshakeFailure;
+
 use std::{
     borrow::Cow,
     fmt::{self, Debug},

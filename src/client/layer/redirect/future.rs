@@ -18,7 +18,14 @@ use super::{
     BodyRepr,
     policy::{Action, Attempt},
 };
-use crate::{Body, ext::RequestUri, into_uri::IntoUriSealed, redirect::FollowRedirectPolicy};
+use crate::{
+    Body,
+    client::layer::timeout::RedirectPause,
+    ext::RequestUri,
+    into_uri::IntoUriSealed,
+    redirect::{BeforeRedirect, FollowRedirectPolicy},
+    rt::BoxSendFuture,
+};
 
 /// Pending future state for handling redirects.
 pub struct Pending<Response> {
@@ -39,6 +46,7 @@ pin_project! {
             #[pin]
             future: Either<S::Future, Oneshot<S, Request<Body>>>,
             pending_future: Option<Pending<S::Response>>,
+            before_redirect: Option<BoxSendFuture>,
             service: S,
             policy: FollowRedirectPolicy,
             request: Request<()>,
@@ -65,11 +73,24 @@ where
             ResponseFutureProj::Redirect {
                 mut future,
                 pending_future,
+                before_redirect,
                 service,
                 policy,
                 request,
                 body_repr,
             } => {
+                if let Some(callback) = before_redirect {
+                    ready!(callback.as_mut().poll(cx));
+                    *before_redirect = None;
+                    if let Some(pause) = request.extensions().get::<RedirectPause>() {
+                        pause.set(false);
+                        // Let the enclosing timeout account for this wait before
+                        // it checks the remaining budget and polls the next send.
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                }
+
                 // Check if we have a pending action to resolve
                 if let Some(mut state) = pending_future.take() {
                     let action = match state.future.as_mut().poll(cx) {
@@ -85,6 +106,7 @@ where
                         RedirectAction {
                             action,
                             future: &mut future,
+                            before_redirect,
                             service,
                             policy,
                             request,
@@ -175,6 +197,7 @@ where
                     RedirectAction {
                         action,
                         future: &mut future,
+                        before_redirect,
                         service,
                         policy,
                         request,
@@ -221,6 +244,7 @@ where
 {
     action: Action,
     future: &'a mut RedirectFuturePin<'a, S>,
+    before_redirect: &'a mut Option<BoxSendFuture>,
     service: &'a S,
     policy: &'a mut FollowRedirectPolicy,
     request: &'a mut Request<()>,
@@ -243,6 +267,16 @@ where
             *redirect.request.uri_mut() = redirect.location;
             redirect.body_repr.try_clone_from(&redirect.body);
             redirect.policy.on_request(redirect.request);
+            *redirect.before_redirect = redirect
+                .request
+                .extensions()
+                .get::<BeforeRedirect>()
+                .map(|callback| callback.call(redirect.request));
+            if redirect.before_redirect.is_some()
+                && let Some(pause) = redirect.request.extensions().get::<RedirectPause>()
+            {
+                pause.set(true);
+            }
 
             redirect.future.set(Either::Right(Oneshot::new(
                 redirect.service.clone(),

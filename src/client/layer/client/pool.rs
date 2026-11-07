@@ -576,7 +576,11 @@ pub enum Error {
 
 impl Error {
     pub(super) fn is_canceled(&self) -> bool {
-        matches!(self, Error::CheckedOutClosedValue)
+        // Dropping a connecting lock closes its waiters before they have sent a request.
+        matches!(
+            self,
+            Error::CheckedOutClosedValue | Error::CheckoutNoLongerWanted
+        )
     }
 }
 

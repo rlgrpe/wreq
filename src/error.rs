@@ -5,6 +5,23 @@ use wreq_proto::ext::ReasonPhrase;
 
 use crate::{StatusCode, util::Escape};
 
+/// The transport stage a request failed in, as reported by
+/// [`Error::transport_cause`].
+///
+/// These causes distinguish failures not covered by the public `is_*` predicates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TransportCause {
+    /// The HTTP CONNECT tunnel through the proxy failed after the proxy
+    /// connection was established (I/O, unparsable or non-200 response,
+    /// including 407).
+    ProxyTunnel,
+    /// The TLS handshake failed and the peer certificate did not verify.
+    TlsCertificate,
+    /// The TLS handshake failed for any other reason.
+    TlsHandshake,
+}
+
 /// A `Result` alias where the `Err` case is `wreq::Error`.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -274,6 +291,41 @@ impl Error {
         }
 
         false
+    }
+
+    /// Returns the transport stage that failed, when it is one of the
+    /// [`TransportCause`] stages.
+    ///
+    /// Inspects typed sources without matching error messages.
+    pub fn transport_cause(&self) -> Option<TransportCause> {
+        use crate::{conn::proxy::tunnel::TunnelError, tls::HandshakeFailure};
+
+        let mut source = self.source();
+
+        while let Some(err) = source {
+            if let Some(handshake) = err.downcast_ref::<HandshakeFailure>() {
+                return Some(if handshake.is_certificate() {
+                    TransportCause::TlsCertificate
+                } else {
+                    TransportCause::TlsHandshake
+                });
+            }
+
+            if let Some(tunnel) = err.downcast_ref::<TunnelError>() {
+                match tunnel {
+                    TunnelError::ProxyAuthRequired
+                    | TunnelError::Io(_)
+                    | TunnelError::Parse(_)
+                    | TunnelError::TunnelUnexpectedEof
+                    | TunnelError::TunnelUnsuccessful => return Some(TransportCause::ProxyTunnel),
+                    TunnelError::ConnectFailed(_) | TunnelError::MissingHost => {}
+                }
+            }
+
+            source = err.source();
+        }
+
+        None
     }
 
     /// Returns true if the error is related to the request or response body

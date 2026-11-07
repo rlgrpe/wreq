@@ -123,6 +123,7 @@ where
         ResponseFuture::Redirect {
             future: Either::Left(service.call(request.clone().map(|_| body))),
             pending_future: None,
+            before_redirect: None,
             service,
             policy,
             request,

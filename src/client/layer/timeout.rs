@@ -4,6 +4,10 @@ pub mod body;
 mod future;
 
 use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -12,8 +16,27 @@ use http::{Request, Response};
 use tower::{BoxError, Layer, Service};
 use wreq_proto::rt::Timer as _;
 
-use self::{body::TimeoutBody, future::ResponseFuture};
-use crate::{config::RequestConfig, rt::Timer};
+use self::{
+    body::TimeoutBody,
+    future::{RedirectTimeout, ResponseFuture},
+};
+use crate::{config::RequestConfig, redirect::BeforeRedirect, rt::Timer};
+
+/// Shared only by the nested redirect/timeout futures of one execute call.
+#[derive(Clone, Default)]
+pub(crate) struct RedirectPause(Arc<AtomicBool>);
+
+impl RedirectPause {
+    pub(crate) fn set(&self, paused: bool) {
+        // The same task polls both layers sequentially. This flag publishes no
+        // other data and is not used for cross-task synchronization.
+        self.0.store(paused, Ordering::Relaxed);
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
 
 /// Options for configuring timeouts.
 #[derive(Clone, Copy, Default)]
@@ -93,14 +116,44 @@ where
     }
 
     #[inline(always)]
-    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+    fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
         let (total_timeout, read_timeout) = fetch_timeout_options(&self.timeout, req.extensions());
+        let pause = if (total_timeout.is_some() || read_timeout.is_some())
+            && req.extensions().get::<BeforeRedirect>().is_some()
+        {
+            let pause = RedirectPause::default();
+            req.extensions_mut().insert(pause.clone());
+            Some(pause)
+        } else {
+            None
+        };
+        let fut = self.inner.call(req);
+        let (read_timeout_fut, total_timeout_fut, redirect_timeout) = if let Some(pause) = pause {
+            let now = self.timer.now();
+            (
+                read_timeout.map(|timeout| self.timer.sleep_until(now + timeout)),
+                total_timeout.map(|timeout| self.timer.sleep_until(now + timeout)),
+                Some(RedirectTimeout::new(
+                    pause,
+                    now,
+                    total_timeout,
+                    read_timeout,
+                )),
+            )
+        } else {
+            (
+                read_timeout.map(|timeout| self.timer.sleep(timeout)),
+                total_timeout.map(|timeout| self.timer.sleep(timeout)),
+                None,
+            )
+        };
         ResponseFuture {
-            fut: self.inner.call(req),
+            fut,
             timer: self.timer.clone(),
             read_timeout,
-            read_timeout_fut: read_timeout.map(|timeout| self.timer.sleep(timeout)),
-            total_timeout_fut: total_timeout.map(|timeout| self.timer.sleep(timeout)),
+            read_timeout_fut,
+            total_timeout_fut,
+            redirect_timeout,
         }
     }
 }

@@ -1,11 +1,466 @@
 mod support;
 use http::StatusCode;
 use http_body_util::BodyExt;
+use std::sync::{Arc, Mutex};
 use support::server;
 use wreq::{
     Body, Client, header,
-    redirect::{History, Policy},
+    redirect::{BeforeRedirect, History, Policy},
 };
+
+#[tokio::test]
+async fn before_redirect_wait_preserves_total_and_read_timeout_budgets() {
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
+    for read_timeout in [false, true] {
+        for network_delay in [Duration::ZERO, Duration::from_millis(150)] {
+            let sends = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&sends);
+            let server = server::http(move |request| {
+                let sends = Arc::clone(&observed);
+                async move {
+                    sends.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(network_delay).await;
+                    if request.uri().path() == "/source" {
+                        http::Response::builder()
+                            .status(307)
+                            .header(header::LOCATION, "/destination")
+                            .body(Body::default())
+                            .unwrap()
+                    } else {
+                        http::Response::new(Body::default())
+                    }
+                }
+            });
+            let builder = Client::builder().no_proxy().redirect(Policy::limited(10));
+            let client = if read_timeout {
+                builder.read_timeout(Duration::from_millis(250))
+            } else {
+                builder.timeout(Duration::from_millis(250))
+            }
+            .build()
+            .unwrap();
+            let mut request = client
+                .get(format!("http://{}/source", server.addr()))
+                .build()
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(BeforeRedirect::new(|_| async {
+                    tokio::time::sleep(Duration::from_millis(350)).await;
+                }));
+            let result = client.execute(request).await;
+            if network_delay.is_zero() {
+                assert_eq!(result.unwrap().status(), StatusCode::OK);
+            } else {
+                assert!(result.unwrap_err().is_timeout());
+            }
+            assert_eq!(
+                sends.load(Ordering::SeqCst),
+                2,
+                "callback wait cannot spend the transport budget"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "stream")]
+#[tokio::test]
+async fn before_redirect_multiple_pauses_preserve_remaining_response_body_deadline() {
+    use std::{convert::Infallible, time::Duration};
+
+    let server = server::http(|request| async move {
+        let location = match request.uri().path() {
+            "/source" => Some("/middle"),
+            "/middle" => Some("/destination"),
+            "/destination" => None,
+            path => panic!("unexpected path: {path}"),
+        };
+        if let Some(location) = location {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            http::Response::builder()
+                .status(307)
+                .header(header::LOCATION, location)
+                .body(Body::default())
+                .unwrap()
+        } else {
+            let body = Body::wrap_stream(futures_util::stream::once(async {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                Ok::<_, Infallible>("Hello")
+            }));
+            http::Response::builder()
+                .header(header::CONTENT_LENGTH, "5")
+                .body(body)
+                .unwrap()
+        }
+    });
+    let client = Client::builder()
+        .no_proxy()
+        .redirect(Policy::limited(10))
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let (entered, mut callbacks) = tokio::sync::mpsc::channel(1);
+    let release = Arc::new(tokio::sync::Notify::new());
+    let callback_release = Arc::clone(&release);
+    let mut request = client
+        .get(format!("http://{}/source", server.addr()))
+        .build()
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(BeforeRedirect::new(move |request| {
+            let path = request.uri().path().to_owned();
+            let entered = entered.clone();
+            let release = Arc::clone(&callback_release);
+            async move {
+                entered.send(path).await.unwrap();
+                release.notified().await;
+            }
+        }));
+
+    let release_callbacks = async {
+        for expected in ["/middle", "/destination"] {
+            assert_eq!(callbacks.recv().await.as_deref(), Some(expected));
+            // Each callback waits longer than the entire transport budget.
+            // Both waits must be excluded, without replacing the first pause
+            // adjustment or forgetting either 500ms network wait.
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            release.notify_one();
+        }
+    };
+    let (response, ()) = tokio::time::timeout(Duration::from_secs(12), async {
+        tokio::join!(client.execute(request), release_callbacks)
+    })
+    .await
+    .expect("both redirect callbacks must be reached and released");
+    let response = response.expect("headers fit the remaining transport budget after both pauses");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.uri().path(), "/destination");
+
+    // The two network waits leave at most one second for the 1.5s body.
+    // Resetting the budget at either hop or at body creation would succeed.
+    let error = tokio::time::timeout(Duration::from_secs(3), response.text())
+        .await
+        .expect("the adjusted total deadline must also bound the body")
+        .expect_err("the body exceeds the remaining, not a fresh, transport budget");
+    assert!(error.is_body() && error.is_timeout());
+}
+
+#[tokio::test]
+async fn before_redirect_concurrent_request_clones_have_independent_pause_state() {
+    use std::time::Duration;
+
+    let timed_at_destination = Arc::new(tokio::sync::Notify::new());
+    let observed_destination = Arc::clone(&timed_at_destination);
+    let server = server::http(move |request| {
+        let timed_at_destination = Arc::clone(&observed_destination);
+        async move {
+            if request.uri().path() == "/source" {
+                http::Response::builder()
+                    .status(307)
+                    .header(header::LOCATION, "/destination")
+                    .body(Body::default())
+                    .unwrap()
+            } else {
+                assert_eq!(request.uri().path(), "/destination");
+                if request.headers()["x-request"] == "timed" {
+                    timed_at_destination.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                http::Response::new(Body::default())
+            }
+        }
+    });
+    let client = Client::builder()
+        .no_proxy()
+        .redirect(Policy::limited(10))
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let blocked_callback = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::clone(&blocked_callback);
+    let release = Arc::new(tokio::sync::Notify::new());
+    let callback_release = Arc::clone(&release);
+    let mut original = client
+        .get(format!("http://{}/source", server.addr()))
+        .header("x-request", "blocked")
+        .build()
+        .unwrap();
+    original
+        .extensions_mut()
+        .insert(BeforeRedirect::new(move |request| {
+            let blocked = request.headers()["x-request"] == "blocked";
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&callback_release);
+            async move {
+                if blocked {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+            }
+        }));
+    let mut cloned = original
+        .try_clone()
+        .expect("buffered request can be cloned");
+    cloned
+        .headers_mut()
+        .insert("x-request", header::HeaderValue::from_static("timed"));
+
+    let timed = client.execute(cloned);
+    tokio::pin!(timed);
+    tokio::select! {
+        () = timed_at_destination.notified() => {},
+        result = &mut timed => panic!("cloned request must reach its destination: {result:?}"),
+    }
+    let blocked = client.execute(original);
+    tokio::pin!(blocked);
+    tokio::select! {
+        () = blocked_callback.notified() => {},
+        result = &mut timed => panic!("cloned request ended before the other callback blocked: {result:?}"),
+        result = &mut blocked => panic!("original request ended before its callback blocked: {result:?}"),
+    }
+
+    let error = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::select! {
+            result = &mut timed => result.expect_err("the silent destination must time out"),
+            result = &mut blocked => panic!("the other request's callback is still blocked: {result:?}"),
+        }
+    })
+    .await
+    .expect("one clone's callback must not pause another execution's deadline");
+    assert!(error.is_timeout());
+
+    release.notify_one();
+    let response = tokio::time::timeout(Duration::from_secs(3), blocked)
+        .await
+        .expect("releasing the callback must resume the original request")
+        .expect("the original request retains its own transport budget");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn dropping_request_drops_pending_redirect_callback() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct MarkDropped(Arc<AtomicBool>);
+    impl Drop for MarkDropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let destinations = Arc::new(AtomicUsize::new(0));
+    let observed_destinations = Arc::clone(&destinations);
+    let server = server::http(move |request| {
+        let destinations = Arc::clone(&observed_destinations);
+        async move {
+            if request.uri().path() == "/source" {
+                http::Response::builder()
+                    .status(307)
+                    .header(header::LOCATION, "/destination")
+                    .body(Body::default())
+                    .unwrap()
+            } else {
+                destinations.fetch_add(1, Ordering::SeqCst);
+                http::Response::new(Body::default())
+            }
+        }
+    });
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let callback_entered = Arc::clone(&entered);
+    let callback_dropped = Arc::clone(&dropped);
+    let client = Client::builder()
+        .no_proxy()
+        .redirect(Policy::limited(10))
+        .build()
+        .unwrap();
+    let mut request = client
+        .get(format!("http://{}/source", server.addr()))
+        .build()
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(BeforeRedirect::new(move |_| {
+            let entered = Arc::clone(&callback_entered);
+            let guard = MarkDropped(Arc::clone(&callback_dropped));
+            async move {
+                let _guard = guard;
+                entered.notify_one();
+                std::future::pending::<()>().await;
+            }
+        }));
+    {
+        let send = client.execute(request);
+        tokio::pin!(send);
+        tokio::select! {
+            () = entered.notified() => {},
+            result = &mut send => panic!("request completed before cancellation: {result:?}"),
+        }
+    }
+    assert!(dropped.load(Ordering::SeqCst));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(destinations.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn before_redirect_observes_prepared_head_and_is_awaited() {
+    for (code, method, destination_method, retains_body) in [
+        (301u16, http::Method::POST, "GET", false),
+        (302, http::Method::POST, "GET", false),
+        (303, http::Method::POST, "GET", false),
+        (307, http::Method::POST, "POST", true),
+        (308, http::Method::POST, "POST", true),
+        (301, http::Method::OPTIONS, "OPTIONS", true),
+        (302, http::Method::OPTIONS, "OPTIONS", true),
+        (303, http::Method::OPTIONS, "GET", false),
+    ] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let destination_events = Arc::clone(&events);
+        let destination = server::http(move |req| {
+            let events = Arc::clone(&destination_events);
+            async move {
+                events.lock().unwrap().push("destination");
+                assert_eq!(req.method(), destination_method);
+                assert!(!req.headers().contains_key(header::AUTHORIZATION));
+                assert!(!req.headers().contains_key(header::COOKIE));
+                assert_eq!(
+                    req.headers().contains_key(header::CONTENT_TYPE),
+                    retains_body
+                );
+                let body = req.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(
+                    body.as_ref(),
+                    if retains_body {
+                        b"hello".as_slice()
+                    } else {
+                        b""
+                    }
+                );
+                http::Response::new(Body::default())
+            }
+        });
+        let destination_uri = format!("http://{}/destination", destination.addr());
+        let location = destination_uri.clone();
+        let source_events = Arc::clone(&events);
+        let source = server::http(move |_| {
+            let location = location.clone();
+            let events = Arc::clone(&source_events);
+            async move {
+                events.lock().unwrap().push("source");
+                http::Response::builder()
+                    .status(code)
+                    .header(header::LOCATION, location)
+                    .body(Body::default())
+                    .unwrap()
+            }
+        });
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let callback_entered = Arc::clone(&entered);
+        let callback_release = Arc::clone(&release);
+        let callback_events = Arc::clone(&events);
+        let hook = BeforeRedirect::new(move |request| {
+            assert_eq!(request.uri(), destination_uri.as_str());
+            assert_eq!(request.method(), destination_method);
+            for name in [header::AUTHORIZATION, header::COOKIE] {
+                assert!(!request.headers().contains_key(name));
+            }
+            for name in [
+                header::CONTENT_TYPE,
+                header::CONTENT_LENGTH,
+                header::CONTENT_ENCODING,
+            ] {
+                assert_eq!(request.headers().contains_key(name), retains_body);
+            }
+            assert_eq!(request.headers()["x-explicit"], "retained");
+            let entered = Arc::clone(&callback_entered);
+            let release = Arc::clone(&callback_release);
+            let events = Arc::clone(&callback_events);
+            async move {
+                events.lock().unwrap().push("callback");
+                entered.notify_one();
+                release.notified().await;
+            }
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(Policy::limited(10))
+            .build()
+            .unwrap();
+        let mut request = client
+            .request(method, format!("http://{}/source", source.addr()))
+            .header(header::AUTHORIZATION, "Bearer example")
+            .header(header::COOKIE, "example=value")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_ENCODING, "identity")
+            .header(header::CONTENT_LENGTH, "5")
+            .header("x-explicit", "retained")
+            .body("hello")
+            .build()
+            .unwrap();
+        request.extensions_mut().insert(hook);
+        let send = client.execute(request);
+        tokio::pin!(send);
+        tokio::select! {
+            () = entered.notified() => {},
+            result = &mut send => panic!("request completed before callback release: {result:?}"),
+        }
+        assert_eq!(*events.lock().unwrap(), ["source", "callback"]);
+        release.notify_one();
+        assert_eq!(send.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["source", "callback", "destination"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn before_redirect_respects_request_policy_and_limit() {
+    let server = server::http(|_| async {
+        http::Response::builder()
+            .status(307)
+            .header(header::LOCATION, "/next")
+            .body(Body::default())
+            .unwrap()
+    });
+    let client = Client::builder()
+        .no_proxy()
+        .redirect(Policy::limited(10))
+        .build()
+        .unwrap();
+    for (policy, expected_callbacks, is_error) in [
+        (Policy::none(), 0, false),
+        (Policy::limited(0), 0, true),
+        (Policy::limited(1), 1, true),
+    ] {
+        let calls = Arc::new(Mutex::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let mut request = client
+            .get(format!("http://{}/source", server.addr()))
+            .redirect(policy)
+            .build()
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(BeforeRedirect::new(move |_| {
+                *callback_calls.lock().unwrap() += 1;
+                std::future::ready(())
+            }));
+        let result = client.execute(request).await;
+        if is_error {
+            assert!(result.unwrap_err().is_redirect());
+        } else {
+            assert_eq!(result.unwrap().status(), StatusCode::TEMPORARY_REDIRECT);
+        }
+        assert_eq!(*calls.lock().unwrap(), expected_callbacks);
+    }
+}
 
 #[tokio::test]
 async fn test_redirect_301_and_302_and_303_changes_post_to_get() {

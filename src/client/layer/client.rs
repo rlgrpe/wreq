@@ -1,6 +1,5 @@
 //! Much of this codebase is adapted and refined from [hyper](https://github.com/hyperium/hyper-util),
 
-mod lazy;
 mod pool;
 
 use std::{
@@ -37,7 +36,6 @@ use {
     std::sync::Arc,
 };
 
-use self::lazy::{Started as Lazy, lazy};
 use crate::{
     client::layer::config::RequestOptions,
     config::RequestConfig,
@@ -410,41 +408,16 @@ where
         // - Otherwise, the Connector is asked to start connecting to the destination Uri.
         // - Meanwhile, the pool Checkout is watching to see if any other request finishes and tries
         //   to insert an idle connection.
-        // - If a new connection is started, but the Checkout wins after (an idle connection became
-        //   available first), the started connection future is spawned into the runtime to
-        //   complete, and then be inserted into the pool as an idle connection.
+        // - If Checkout wins, the unused connection attempt is canceled. It must not outlive
+        //   the request and retain the connector and pool while waiting for an unresponsive peer.
         let checkout = self.pool.checkout(descriptor.id());
         let connect = self.connect_to(descriptor);
-        let is_ver_h2 = self.config.ver == Ver::Http2;
 
-        // The order of the `select` is depended on below...
+        // Poll checkout first so an immediately available connection avoids starting another.
 
         match futures_util::future::select(checkout, connect).await {
-            // Checkout won, connect future may have been started or not.
-            //
-            // If it has, let it finish and insert back into the pool,
-            // so as to not waste the socket...
             Either::Left((Ok(checked_out), connecting)) => {
-                // This depends on the `select` above having the correct
-                // order, such that if the checkout future were ready
-                // immediately, the connect future will never have been
-                // started.
-                //
-                // If it *wasn't* ready yet, then the connect future will
-                // have been started...
-                if connecting.started() {
-                    let bg = connecting
-                        .map_err(|_err| {
-                            trace!("background connect error: {}", _err);
-                        })
-                        .map(|_pooled| {
-                            // dropping here should just place it in
-                            // the Pool for us...
-                        });
-                    // An execute error here isn't important, we're just trying
-                    // to prevent a waste of a socket...
-                    self.exec.execute(bg);
-                }
+                drop(connecting);
                 Ok(checked_out)
             }
             // Connect won, checkout can just be dropped.
@@ -468,8 +441,8 @@ where
             }
             Either::Right((Err(err), checkout)) => {
                 if err.is_canceled() {
-                    checkout.await.map_err(move |err| {
-                        if is_ver_h2 && err.is_canceled() {
+                    checkout.await.map_err(|err| {
+                        if err.is_canceled() {
                             ClientConnectError::CheckoutIsClosed(err)
                         } else {
                             ClientConnectError::Normal(Error::new(ErrorKind::Connect, err))
@@ -485,7 +458,7 @@ where
     fn connect_to(
         &self,
         descriptor: ConnectionDescriptor,
-    ) -> impl Lazy<Output = Result<pool::Pooled<PoolClient<B>, ConnectionId>, Error>>
+    ) -> impl Future<Output = Result<pool::Pooled<PoolClient<B>, ConnectionId>, Error>>
     + Send
     + Unpin
     + 'static {
@@ -500,7 +473,7 @@ where
         };
         let is_ver_h2 = ver == Ver::Http2;
         let connector = self.connector.clone();
-        lazy(move || {
+        future::lazy(move |_| {
             // Try to take a "connecting lock".
             //
             // If the pool_key is for HTTP/2, and there is already a
@@ -660,6 +633,7 @@ where
                     }),
             )
         })
+        .flatten()
     }
 }
 

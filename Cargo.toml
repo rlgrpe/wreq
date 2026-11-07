@@ -92,7 +92,7 @@ prefix-symbols = ["btls/prefix-symbols"]
 url = "2.5.8"
 bytes = "1.11.1"
 http = "1.4.0"
-http2 = "0.5.17"
+http2 = { version = "0.5.20", git = "https://github.com/rlgrpe/http2", tag = "v0.5.20+rlgrpe.1" }
 httparse = "1.10.1"
 http-body = "1.0.1"
 http-body-util = "0.1.4"
@@ -102,13 +102,13 @@ futures-util = { version = "0.3.33", default-features = false }
 socket2 = { version = "0.6.3", features = ["all"] }
 ipnet = "2.12.0"
 lru = "0.18.0"
-btls = "0.5.6"
-btls-sys = "0.5.6"
-tokio-btls = "0.5.6"
+btls = { version = "0.5.6", git = "https://github.com/0x676e67/btls", rev = "0f5416d1f61eb4f64a9f2f4d8b867495305d61c1" }
+btls-sys = { version = "0.5.6", git = "https://github.com/0x676e67/btls", rev = "0f5416d1f61eb4f64a9f2f4d8b867495305d61c1" }
+tokio-btls = { version = "0.5.6", git = "https://github.com/0x676e67/btls", rev = "0f5416d1f61eb4f64a9f2f4d8b867495305d61c1" }
 tokio = { version = "1.52.3", default-features = false }
 compio = { version = "0.19.2", features = ["io", "io-compat"], optional = true }
-wreq-rt = { version = "0.2.2-rc.2", default-features = false }
-wreq-proto = { version = "0.2.3", default-features = false }
+wreq-rt = { version = "0.2.2-rc.4", git = "https://github.com/rlgrpe/wreq-proto", tag = "v0.2.6+rlgrpe.1", default-features = false }
+wreq-proto = { version = "0.2.6", git = "https://github.com/rlgrpe/wreq-proto", tag = "v0.2.6+rlgrpe.1", default-features = false }
 tower = { version = "0.5.3", default-features = false, features = [
     "timeout",
     "util",
@@ -175,7 +175,7 @@ system-configuration = { version = "0.8.0", optional = true }
 libc = "0.2.186"
 
 [dev-dependencies]
-wreq-rt = { version = "0.2.2-rc.1", features = ["tokio-rt", "compio-rt"] }
+wreq-rt = { version = "0.2.2-rc.4", git = "https://github.com/rlgrpe/wreq-proto", tag = "v0.2.6+rlgrpe.1", features = ["tokio-rt", "compio-rt"] }
 tokio = { version = "1.0", default-features = false, features = [
     "macros",
     "rt-multi-thread",
@@ -383,8 +383,3 @@ path = "examples/unix_socket.rs"
 name = "rt"
 path = "examples/rt.rs"
 required-features = ["compio-rt"]
-
-[patch.crates-io]
-btls = { git = "https://github.com/0x676e67/btls", branch = "main" }
-btls-sys = { git = "https://github.com/0x676e67/btls", branch = "main" }
-tokio-btls = { git = "https://github.com/0x676e67/btls", branch = "main" }

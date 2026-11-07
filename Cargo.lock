@@ -224,7 +224,7 @@ dependencies = [
 [[package]]
 name = "btls"
 version = "0.5.6"
-source = "git+https://github.com/0x676e67/btls?branch=main#0f5416d1f61eb4f64a9f2f4d8b867495305d61c1"
+source = "git+https://github.com/0x676e67/btls?rev=0f5416d1f61eb4f64a9f2f4d8b867495305d61c1#0f5416d1f61eb4f64a9f2f4d8b867495305d61c1"
 dependencies = [
  "bitflags",
  "btls-sys",
@@ -236,7 +236,7 @@ dependencies = [
 [[package]]
 name = "btls-sys"
 version = "0.5.6"
-source = "git+https://github.com/0x676e67/btls?branch=main#0f5416d1f61eb4f64a9f2f4d8b867495305d61c1"
+source = "git+https://github.com/0x676e67/btls?rev=0f5416d1f61eb4f64a9f2f4d8b867495305d61c1#0f5416d1f61eb4f64a9f2f4d8b867495305d61c1"
 dependencies = [
  "bindgen",
  "cmake",
@@ -1411,8 +1411,7 @@ dependencies = [
 [[package]]
 name = "http2"
 version = "0.5.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92d3114be2f413b2e491e686b93a28cda30c355cffc8d091a57f8be4b1342896"
+source = "git+https://github.com/rlgrpe/http2?tag=v0.5.20%2Brlgrpe.1#e7c7513516f6a86558f78be15913f49cc1e81d18"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3098,7 +3097,7 @@ dependencies = [
 [[package]]
 name = "tokio-btls"
 version = "0.5.6"
-source = "git+https://github.com/0x676e67/btls?branch=main#0f5416d1f61eb4f64a9f2f4d8b867495305d61c1"
+source = "git+https://github.com/0x676e67/btls?rev=0f5416d1f61eb4f64a9f2f4d8b867495305d61c1#0f5416d1f61eb4f64a9f2f4d8b867495305d61c1"
 dependencies = [
  "btls",
  "tokio",
@@ -3917,8 +3916,7 @@ dependencies = [
 [[package]]
 name = "wreq-proto"
 version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4d829f0427a5064829976fe790641ca21abb1d83d844812baf022dc0bdf2db"
+source = "git+https://github.com/rlgrpe/wreq-proto?tag=v0.2.6%2Brlgrpe.1#82966a8a6cefb31ed4646646d715e1c6fc3e10a1"
 dependencies = [
  "bytes",
  "futures-channel",
@@ -3938,8 +3936,7 @@ dependencies = [
 [[package]]
 name = "wreq-rt"
 version = "0.2.2-rc.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99e9bce67a3fa3dd3f1503f066d86661c9caf399a763d3bd184da7afaf886c8b"
+source = "git+https://github.com/rlgrpe/wreq-proto?tag=v0.2.6%2Brlgrpe.1#82966a8a6cefb31ed4646646d715e1c6fc3e10a1"
 dependencies = [
  "compio",
  "futures-util",
